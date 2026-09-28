@@ -4,7 +4,13 @@
 //! the on-chain reward registry (caller can never dictate the payout amount).
 use super::*;
 use alvinmunk_reputation::{ReputationContract, ReputationContractClient};
-use soroban_sdk::{testutils::Address as _, token, Env};
+use soroban_sdk::{
+    testutils::{
+        storage::{Persistent as _, Temporary as _},
+        Address as _, Ledger as _,
+    },
+    token, Env,
+};
 
 struct Fixture<'a> {
     env: Env,
@@ -16,7 +22,10 @@ struct Fixture<'a> {
 }
 
 fn setup() -> Fixture<'static> {
-    let env = Env::default();
+    setup_in(Env::default())
+}
+
+fn setup_in(env: Env) -> Fixture<'static> {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let attester = Address::generate(&env);
@@ -258,5 +267,210 @@ proptest! {
             }
             prop_assert!(paid <= cap);
         }
+    }
+}
+
+/// Release build of this contract, committed so the upgrade path can be tested without a
+/// wasm build step in CI. Refresh with `make upgrade-fixtures` after changing the contract.
+const REWARDS_WASM: &[u8] = include_bytes!("../testdata/alvinmunk_rewards.wasm");
+
+#[test]
+fn upgrade_to_identical_wasm_preserves_reward_table_and_treasury() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+
+    let hash = f.env.deployer().upload_contract_wasm(REWARDS_WASM);
+    f.rewards.upgrade(&hash);
+
+    let r = f.rewards.get_reward(&1u32).unwrap();
+    assert_eq!((r.threshold, r.amount, r.active), (30, 50, true));
+
+    // The upgraded contract still pays the stored amount from the same treasury.
+    let user = Address::generate(&f.env);
+    f.rep.award_xp(&f.attester, &user, &2u32, &30u64);
+    f.rewards.claim_reward(&user, &1u32);
+    let token_c = token::TokenClient::new(&f.env, &f.usdc);
+    assert_eq!(token_c.balance(&user), 50);
+    assert_eq!(token_c.balance(&f.rewards_id), 950);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+fn non_admin_upgrade_reverts() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let rep = Address::generate(&env);
+    let id = env.register(RewardsContract, ());
+    let client = RewardsContractClient::new(&env, &id);
+    client.init(&admin, &usdc, &rep);
+    let hash = soroban_sdk::BytesN::from_array(&env, &[1; 32]);
+    client.upgrade(&hash);
+}
+
+/// The host error a `panic_with_error!(Error::X)` surfaces as through a `try_` call.
+fn contract_err(e: Error) -> soroban_sdk::Error {
+    soroban_sdk::Error::from_contract_error(e as u32)
+}
+
+/// A wallet with enough Earned XP to clear `threshold`.
+fn earner(f: &Fixture, xp: u64) -> Address {
+    let user = Address::generate(&f.env);
+    f.rep.award_xp(&f.attester, &user, &2u32, &xp);
+    user
+}
+
+#[test]
+fn capped_reward_pays_the_last_claim_and_rejects_the_next() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.set_reward_supply(&1u32, &2u32);
+
+    let (a, b, c) = (earner(&f, 30), earner(&f, 30), earner(&f, 30));
+    f.rewards.claim_reward(&a, &1u32);
+    f.rewards.claim_reward(&b, &1u32); // the last one the pool pays
+
+    let stats = f.rewards.get_reward_stats(&1u32);
+    assert_eq!((stats.max_claims, stats.claims), (2, 2));
+    assert_eq!(
+        f.rewards.try_claim_reward(&c, &1u32),
+        Err(Ok(contract_err(Error::RewardExhausted)))
+    );
+    let token_c = token::TokenClient::new(&f.env, &f.usdc);
+    assert_eq!(token_c.balance(&c), 0);
+    assert_eq!(token_c.balance(&f.rewards_id), 900);
+}
+
+#[test]
+fn uncapped_reward_counts_claims_without_a_limit() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &10i128);
+    for _ in 0..5 {
+        let u = earner(&f, 30);
+        f.rewards.claim_reward(&u, &1u32);
+    }
+    let stats = f.rewards.get_reward_stats(&1u32);
+    assert_eq!((stats.max_claims, stats.claims), (0, 5));
+}
+
+#[test]
+fn get_rewards_reports_supply_and_claims() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.add_reward(&2u32, &60u64, &100i128);
+    f.rewards.set_reward_supply(&1u32, &3u32);
+    let u = earner(&f, 30);
+    f.rewards.claim_reward(&u, &1u32);
+
+    let rows = f.rewards.get_rewards();
+    let r1 = rows.get(0).unwrap();
+    assert_eq!((r1.id, r1.max_claims, r1.claims), (1, 3, 1));
+    let r2 = rows.get(1).unwrap();
+    assert_eq!((r2.id, r2.max_claims, r2.claims), (2, 0, 0));
+}
+
+#[test]
+fn supply_cannot_drop_below_claims_already_paid() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    for _ in 0..2 {
+        let u = earner(&f, 30);
+        f.rewards.claim_reward(&u, &1u32);
+    }
+    assert_eq!(
+        f.rewards.try_set_reward_supply(&1u32, &1u32),
+        Err(Ok(contract_err(Error::InvalidSupply)))
+    );
+    // Capping at exactly the paid count closes the pool; 0 reopens it.
+    f.rewards.set_reward_supply(&1u32, &2u32);
+    let late = earner(&f, 30);
+    assert_eq!(
+        f.rewards.try_claim_reward(&late, &1u32),
+        Err(Ok(contract_err(Error::RewardExhausted)))
+    );
+    f.rewards.set_reward_supply(&1u32, &0u32);
+    f.rewards.claim_reward(&late, &1u32);
+    assert_eq!(f.rewards.get_reward_stats(&1u32).claims, 3);
+}
+
+#[test]
+fn supply_for_an_unknown_reward_reverts() {
+    let f = setup();
+    assert_eq!(
+        f.rewards.try_set_reward_supply(&9u32, &5u32),
+        Err(Ok(contract_err(Error::RewardNotFound)))
+    );
+}
+
+// --- Storage TTLs ---
+
+/// Live `state_archival` settings from `stellar network settings` (checked 2026-09-28):
+/// (min_persistent_ttl, min_temporary_ttl, max_entry_ttl).
+const TESTNET_TTLS: (u32, u32, u32) = (120_960, 720, 3_110_400);
+const MAINNET_TTLS: (u32, u32, u32) = (2_073_600, 17_280, 3_110_400);
+
+/// `setup()` on a ledger with the given network TTL limits, set before registration so the
+/// instances get the same TTLs as on the network.
+fn setup_with_ttls((min_persistent, min_temp, max_ttl): (u32, u32, u32)) -> Fixture<'static> {
+    let env = Env::default();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1_000;
+        l.min_persistent_entry_ttl = min_persistent;
+        l.min_temp_entry_ttl = min_temp;
+        l.max_entry_ttl = max_ttl;
+    });
+    setup_in(env)
+}
+
+fn ttl(f: &Fixture, key: &DataKey) -> u32 {
+    f.env
+        .as_contract(&f.rewards_id, || f.env.storage().persistent().get_ttl(key))
+}
+
+#[test]
+fn writes_extend_reward_entries_to_bump_extend() {
+    for ttls in [TESTNET_TTLS, MAINNET_TTLS] {
+        let f = setup_with_ttls(ttls);
+        let user = earner(&f, 100);
+        let flagged = Address::generate(&f.env);
+        f.rewards.add_reward(&1u32, &50u64, &200i128);
+        f.rewards.set_reward_supply(&1u32, &5u32);
+        f.rewards.set_frozen(&flagged, &true);
+        f.rewards.set_funded(&user, &true);
+        f.rewards.claim_reward(&user, &1u32);
+
+        for key in [
+            DataKey::Reward(1),
+            DataKey::RewardIds,
+            DataKey::RewardStats(1),
+            DataKey::RewardClaimed(1, user.clone()),
+            DataKey::Frozen(flagged.clone()),
+            DataKey::Funded(user.clone()),
+        ] {
+            assert_eq!(ttl(&f, &key), BUMP_EXTEND);
+        }
+
+        // Days later, an admin edit tops the reward row back up.
+        f.env
+            .ledger()
+            .with_mut(|l| l.sequence_number += DAY_LEDGERS * 3);
+        f.rewards.set_reward_active(&1u32, &true);
+        assert_eq!(ttl(&f, &DataKey::Reward(1)), BUMP_EXTEND);
+    }
+}
+
+/// The per-day payout counter is temporary and lives ~2 days, not the persistent target
+/// (which is past max_entry_ttl when doubled, and would trap the claim).
+#[test]
+fn daily_paid_counter_lives_two_days() {
+    for ttls in [TESTNET_TTLS, MAINNET_TTLS] {
+        let f = setup_with_ttls(ttls);
+        let user = earner(&f, 100);
+        f.rewards.add_reward(&1u32, &50u64, &200i128);
+        f.rewards.claim_reward(&user, &1u32);
+        let paid_ttl = f.env.as_contract(&f.rewards_id, || {
+            f.env.storage().temporary().get_ttl(&DataKey::DailyPaid(0))
+        });
+        assert_eq!(paid_ttl, DAY_LEDGERS * 2);
     }
 }

@@ -8,6 +8,7 @@ import {
   rankLeaderboard,
   mergeSocialRecords,
   detectReciprocalRings,
+  detectRingCandidates,
   buildClaimPath,
   buildClaimUrl,
   shortAddr,
@@ -57,8 +58,15 @@ describe('readNetworkConfig', () => {
 });
 
 describe('SCHEMA', () => {
-  it('namespaces vouch vs quest distinctly', () => {
-    expect(SCHEMA.VOUCH).not.toBe(SCHEMA.QUEST);
+  it('gives every namespace a distinct id', () => {
+    const ids = Object.values(SCHEMA);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('keeps QUEST at 2 (the id every deployed quest passes) and 1 reserved', () => {
+    expect(SCHEMA.QUEST).toBe(2);
+    expect(SCHEMA.RESERVED).toBe(1);
+    expect(SCHEMA).not.toHaveProperty('VOUCH');
   });
 });
 
@@ -127,6 +135,84 @@ describe('detectReciprocalRings', () => {
   });
   it('returns empty when no reciprocity', () => {
     expect(detectReciprocalRings([{ from: 'A', claimer: 'B' }])).toEqual([]);
+  });
+});
+
+describe('detectRingCandidates', () => {
+  const addrs = (pairs: { from: string; claimer: string }[]) =>
+    detectRingCandidates(pairs).map((c) => c.address);
+
+  it('flags a reciprocal pair and nothing else', () => {
+    expect(
+      detectRingCandidates([
+        { from: 'A', claimer: 'B' },
+        { from: 'B', claimer: 'A' },
+        { from: 'C', claimer: 'D' },
+      ]),
+    ).toEqual([
+      { address: 'A', reasons: ['reciprocal'] },
+      { address: 'B', reasons: ['reciprocal'] },
+    ]);
+  });
+
+  it('flags every member of a three-member cycle', () => {
+    expect(
+      detectRingCandidates([
+        { from: 'A', claimer: 'B' },
+        { from: 'B', claimer: 'C' },
+        { from: 'C', claimer: 'A' },
+      ]),
+    ).toEqual([
+      { address: 'A', reasons: ['cycle3'] },
+      { address: 'B', reasons: ['cycle3'] },
+      { address: 'C', reasons: ['cycle3'] },
+    ]);
+  });
+
+  it('does not flag unrelated one-way vouches', () => {
+    expect(
+      addrs([
+        { from: 'A', claimer: 'B' },
+        { from: 'C', claimer: 'D' },
+        { from: 'E', claimer: 'F' },
+      ]),
+    ).toEqual([]);
+  });
+
+  it('does not flag a busy honest hub', () => {
+    const pairs = ['B', 'C', 'D', 'E', 'F', 'G'].flatMap((x) => [
+      { from: 'HUB', claimer: x },
+      { from: `${x}2`, claimer: 'HUB' },
+    ]);
+    expect(addrs(pairs)).toEqual([]);
+  });
+
+  it('does not flag an open chain', () => {
+    expect(
+      addrs([
+        { from: 'A', claimer: 'B' },
+        { from: 'B', claimer: 'C' },
+        { from: 'C', claimer: 'D' },
+      ]),
+    ).toEqual([]);
+  });
+
+  it('ignores self-loops and duplicate edges', () => {
+    expect(
+      addrs([
+        { from: 'A', claimer: 'A' },
+        { from: 'A', claimer: 'B' },
+        { from: 'A', claimer: 'B' },
+      ]),
+    ).toEqual([]);
+  });
+
+  it('reports a back-and-forth pair as reciprocal only, not as a cycle', () => {
+    const out = detectRingCandidates([
+      { from: 'A', claimer: 'B' },
+      { from: 'B', claimer: 'A' },
+    ]);
+    expect(out.every((c) => c.reasons.join() === 'reciprocal')).toBe(true);
   });
 });
 

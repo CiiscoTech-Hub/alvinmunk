@@ -7,8 +7,11 @@
  */
 
 // ── Schema ids (namespacing for attestations). Issuers agree off-chain. ──
+// `schema_id` is whatever the attester passes to `award_xp`; every deployed quest uses
+// QUEST (scripts/redeploy-all.sh). Vouches never touch Earned, so no `att_set` carries 1.
 export const SCHEMA = {
-  VOUCH: 1,
+  /** Reserved, never emitted (formerly VOUCH). Do not reuse for a new namespace. */
+  RESERVED: 1,
   QUEST: 2,
 } as const;
 export type SchemaId = (typeof SCHEMA)[keyof typeof SCHEMA];
@@ -20,15 +23,15 @@ export const EVENTS = {
   ATTESTATION_SET: 'att_set',
   /** topics ('xp', addr) · data (amount, newTotal) — Earned track total */
   XP: 'xp',
-  /** topics ('social', addr) · data (amount, newTotal) — Social track total (leaderboard source) */
+  /** topics ('social', addr) · data (amount, newTotal) — Social track total (leaderboard source). `amount` is unsigned: compare newTotal with the previous total for the direction */
   SOCIAL: 'social',
-  /** topics ('vouch', 'minted'|'claimed') · data (id, from, to) */
+  /** topics ('vouch', 'minted'|'claimed'|'slashed') · data minted (id, from) · claimed (id, from, claimer) · slashed (id, from, stake) */
   VOUCH: 'vouch',
-  /** topics ('quest', 'created'|'awarded') · data varies */
+  /** topics ('quest', 'created'|'awarded') · data created id · awarded (quest_id, recipient) */
   QUEST: 'quest',
   /** topics ('tipped', from, to) · data amount */
   TIPPED: 'tipped',
-  /** topics ('reward', to) · data (reward_id, amount) */
+  /** topics ('reward', to) · data (reward_id, amount, claims) */
   REWARD: 'reward',
 } as const;
 
@@ -40,13 +43,20 @@ export interface Attestation {
   revoked: boolean;
 }
 
+// ── Mirror of the on-chain Vouch struct (read-view shape of `get_vouch`) ──
 export interface Vouch {
   id: number;
-  from: string;
-  to: string;
+  from: string; // voucher address
+  /** sha256(secret) — BytesN<32> */
+  claim_hash: Uint8Array;
   note: string;
   claimed: boolean;
-  created: number;
+  /** Option<Address> — null until claimed */
+  claimer: string | null;
+  created: number; // ledger timestamp at mint
+  /** Social XP escrowed at mint */
+  stake: number;
+  slashed: boolean;
 }
 
 export interface Profile {
@@ -190,6 +200,60 @@ export function detectReciprocalRings(pairs: VouchPair[]): string[] {
     }
   }
   return [...flagged].sort();
+}
+
+/** Why an address was flagged by {@link detectRingCandidates}. */
+export type RingReason = 'reciprocal' | 'cycle3';
+
+export interface RingCandidate {
+  address: string;
+  reasons: RingReason[];
+}
+
+/**
+ * Ring candidates for the frozen set (belts/08): reciprocal pairs (A→B, B→A) and
+ * three-member cycles (A→B→C→A) in the claimed-vouch graph. Self-loops and duplicate
+ * edges are ignored, and a pair that merely goes back and forth is reported only as
+ * `reciprocal`, never as a cycle. Output is sorted by address for stable diffs.
+ *
+ * There is deliberately no raw-degree rule: the most active honest users vouch for and
+ * are vouched by many people, and would be the first false positives. Candidates are
+ * signals to review, not verdicts.
+ */
+export function detectRingCandidates(pairs: VouchPair[]): RingCandidate[] {
+  const adj = new Map<string, Set<string>>();
+  for (const { from, claimer } of pairs) {
+    if (from === claimer) continue;
+    if (!adj.has(from)) adj.set(from, new Set());
+    adj.get(from)!.add(claimer);
+  }
+  const has = (a: string, b: string) => adj.get(a)?.has(b) ?? false;
+  const reasons = new Map<string, Set<RingReason>>();
+  const flag = (addr: string, why: RingReason) => {
+    if (!reasons.has(addr)) reasons.set(addr, new Set());
+    reasons.get(addr)!.add(why);
+  };
+
+  for (const [a, outs] of adj) {
+    for (const b of outs) {
+      if (has(b, a)) {
+        flag(a, 'reciprocal');
+        flag(b, 'reciprocal');
+      }
+      for (const c of adj.get(b) ?? []) {
+        if (c !== a && c !== b && has(c, a)) {
+          flag(a, 'cycle3');
+          flag(b, 'cycle3');
+          flag(c, 'cycle3');
+        }
+      }
+    }
+  }
+
+  return [...reasons.keys()].sort().map((address) => ({
+    address,
+    reasons: [...reasons.get(address)!].sort() as RingReason[],
+  }));
 }
 
 /**

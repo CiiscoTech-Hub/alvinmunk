@@ -6,8 +6,9 @@ extern crate std;
 use super::*;
 use alvinmunk_reputation::{ReputationContract, ReputationContractClient};
 use ed25519_dalek::{Signer, SigningKey};
+use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Ledger as _},
     BytesN, Env,
 };
 
@@ -24,7 +25,10 @@ fn signing_key(seed: u8) -> SigningKey {
 }
 
 fn setup() -> Fixture<'static> {
-    let env = Env::default();
+    setup_in(Env::default())
+}
+
+fn setup_in(env: Env) -> Fixture<'static> {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let attester_sk = signing_key(7);
@@ -165,4 +169,132 @@ fn same_week_completions_do_not_double_count_streak() {
     award(&f, &f.attester_sk, 1, &user);
     award(&f, &f.attester_sk, 2, &user); // same week
     assert_eq!(f.quest.get_streak(&user).weeks, 1);
+}
+
+proptest! {
+    // Each case runs up to 50 signed awards in a fresh env, so keep the case count modest.
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Invariant: for any sorted sequence of completion weeks (duplicates allowed), the
+    /// on-chain streak matches a reference model exactly — same week = no change, the
+    /// next week = +1, any gap = reset to 1 — and `best` is the running maximum.
+    #[test]
+    fn weekly_streak_matches_reference_model(mut weeks in prop::collection::vec(0u64..1000, 1..50)) {
+        let f = setup();
+        let user = Address::generate(&f.env);
+        weeks.sort_unstable();
+
+        let mut run = 0u32;
+        let mut best = 0u32;
+        let mut prev: Option<u64> = None;
+
+        for (i, &w) in weeks.iter().enumerate() {
+            // A fresh quest per completion: the replay guard is keyed per (quest, recipient).
+            let quest_id = (i as u32) + 1;
+            f.quest.create_quest(&quest_id, &2u32, &10u64);
+            f.env.ledger().with_mut(|l| l.timestamp = w * super::WEEK_SECS);
+            award(&f, &f.attester_sk, quest_id, &user);
+
+            run = match prev {
+                Some(p) if p == w => run,
+                Some(p) if p + 1 == w => run + 1,
+                _ => 1,
+            };
+            best = best.max(run);
+            prev = Some(w);
+
+            let s = f.quest.get_streak(&user);
+            prop_assert_eq!(s.weeks, run);
+            prop_assert_eq!(s.best, best);
+            prop_assert!(s.best >= s.weeks);
+        }
+    }
+}
+
+/// Release build of this contract, committed so the upgrade path can be tested without a
+/// wasm build step in CI. Refresh with `make upgrade-fixtures` after changing the contract.
+const QUEST_WASM: &[u8] = include_bytes!("../testdata/alvinmunk_quest_registry.wasm");
+
+#[test]
+fn upgrade_to_identical_wasm_preserves_quests_and_attester_keys() {
+    let f = setup();
+    f.quest.create_quest(&1u32, &2u32, &50u64);
+
+    let hash = f.env.deployer().upload_contract_wasm(QUEST_WASM);
+    f.quest.upgrade(&hash);
+
+    // The quest config and the allowlisted attester key survived: the upgraded contract
+    // still verifies the signed payload and credits Earned XP through Reputation.
+    let user = Address::generate(&f.env);
+    award(&f, &f.attester_sk, 1, &user);
+    assert_eq!(f.rep.get_earned(&user), 50);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
+fn non_admin_upgrade_reverts() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let rep = Address::generate(&env);
+    let id = env.register(QuestRegistryContract, ());
+    let client = QuestRegistryContractClient::new(&env, &id);
+    client.init(&admin, &rep);
+    let hash = soroban_sdk::BytesN::from_array(&env, &[1; 32]);
+    client.upgrade(&hash);
+}
+
+// --- Storage TTLs ---
+
+/// Live `state_archival` settings from `stellar network settings` (checked 2026-09-28):
+/// (min_persistent_ttl, min_temporary_ttl, max_entry_ttl).
+const TESTNET_TTLS: (u32, u32, u32) = (120_960, 720, 3_110_400);
+const MAINNET_TTLS: (u32, u32, u32) = (2_073_600, 17_280, 3_110_400);
+
+/// `setup()` on a ledger with the given network TTL limits, set before registration so the
+/// instances get the same TTLs as on the network.
+fn setup_with_ttls((min_persistent, min_temp, max_ttl): (u32, u32, u32)) -> Fixture<'static> {
+    let env = Env::default();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1_000;
+        l.min_persistent_entry_ttl = min_persistent;
+        l.min_temp_entry_ttl = min_temp;
+        l.max_entry_ttl = max_ttl;
+    });
+    setup_in(env)
+}
+
+fn ttl(f: &Fixture, key: &DataKey) -> u32 {
+    f.env.as_contract(&f.quest.address, || {
+        f.env.storage().persistent().get_ttl(key)
+    })
+}
+
+#[test]
+fn writes_extend_quest_entries_to_bump_extend() {
+    for ttls in [TESTNET_TTLS, MAINNET_TTLS] {
+        let f = setup_with_ttls(ttls);
+        let user = Address::generate(&f.env);
+        f.quest.create_quest(&1u32, &2u32, &50u64);
+        assert_eq!(ttl(&f, &DataKey::Quest(1)), BUMP_EXTEND);
+
+        award(&f, &f.attester_sk, 1, &user);
+        assert_eq!(ttl(&f, &DataKey::Claimed(1, user.clone())), BUMP_EXTEND);
+        assert_eq!(ttl(&f, &DataKey::Streak(user.clone())), BUMP_EXTEND);
+
+        // Days later, toggling the quest and a second award top their entries back up.
+        f.env.ledger().with_mut(|l| {
+            l.sequence_number += DAY_LEDGERS * 3;
+            l.timestamp += WEEK_SECS;
+        });
+        f.quest.set_quest_active(&1u32, &true);
+        f.quest.create_quest(&2u32, &2u32, &10u64);
+        award(&f, &f.attester_sk, 2, &user);
+        assert_eq!(ttl(&f, &DataKey::Quest(1)), BUMP_EXTEND);
+        assert_eq!(ttl(&f, &DataKey::Streak(user.clone())), BUMP_EXTEND);
+        // The first replay guard was not written again, so it kept ageing.
+        assert_eq!(
+            ttl(&f, &DataKey::Claimed(1, user)),
+            BUMP_EXTEND - DAY_LEDGERS * 3
+        );
+    }
 }
