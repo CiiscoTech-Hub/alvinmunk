@@ -487,9 +487,9 @@ read via `get_attestation()`, `get_vouch()`, etc.
 
 ```rust
 pub struct Attestation {
-    pub issuer: Address,
-    pub value: i128,       // XP amount (stored as i128, interpret as u64)
-    pub timestamp: u64,
+    pub issuer: Address,   // latest issuer to credit this schema
+    pub value: i128,       // running total per (addr, schema_id), accumulating all awards
+    pub timestamp: u64,    // ledger timestamp of the most recent award
     pub revoked: bool,
 }
 ```

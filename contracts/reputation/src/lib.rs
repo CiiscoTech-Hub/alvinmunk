@@ -485,13 +485,19 @@ impl ReputationContract {
             .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
 
         let ts = env.ledger().timestamp();
+        let att_key = DataKey::Attestation(to.clone(), schema_id);
+        let new_value = if let Some(att) = env.storage().persistent().get::<_, Attestation>(&att_key) {
+            att.value.checked_add(amount as i128).unwrap_or_else(|| panic_with_error!(env, Error::Overflow))
+        } else {
+            amount as i128
+        };
+
         let att = Attestation {
             issuer: issuer.clone(),
-            value: amount as i128,
+            value: new_value,
             timestamp: ts,
             revoked: false,
         };
-        let att_key = DataKey::Attestation(to.clone(), schema_id);
         env.storage().persistent().set(&att_key, &att);
         env.storage()
             .persistent()

@@ -311,6 +311,27 @@ fn get_profile_aggregates_across_social_and_earned_state_changes() {
     assert!(p2.verified);
 }
 
+#[test]
+fn multiple_awards_under_same_schema_accumulate() {
+    let (env, client, _admin) = setup();
+    let attester1 = Address::generate(&env);
+    let attester2 = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.add_attester(&attester1);
+    client.add_attester(&attester2);
+
+    client.award_xp(&attester1, &user, &2u32, &50u64);
+    let att1 = client.get_attestation(&user, &2).unwrap();
+    assert_eq!(att1.value, 50);
+    assert_eq!(att1.issuer, attester1);
+
+    client.award_xp(&attester2, &user, &2u32, &7u64);
+    let att2 = client.get_attestation(&user, &2).unwrap();
+    assert_eq!(att2.value, 57);
+    assert_eq!(att2.issuer, attester2);
+    assert_eq!(client.get_earned(&user), 57);
+}
+
 // --- Property/fuzz tests on the XP math (Green-belt AC) ---
 use proptest::prelude::*;
 
